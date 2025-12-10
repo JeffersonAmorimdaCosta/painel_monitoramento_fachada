@@ -499,34 +499,88 @@ int main() {
         tokenAdmin = Token{adminUser->id, Perfil::ADMIN};
     }
 
+    // 3. Thread de Monitoramento (ID com "SHA X: ...")
     std::atomic<bool> running(true);
     std::thread monitorThread([&]() {
-        std::string caminhoDoSHA = "C:/Users/Jefferson/Projetos/padroes_projetos/simulador-hidrometro-analogico-v2";
+        std::vector<std::string> locaisDosSHAs;
+        
+        // Adicione seus caminhos aqui
+        locaisDosSHAs.push_back("C:/Users/Jefferson/Projetos/padroes_projetos/simulador-hidrometro-analogico-v2");
+        locaisDosSHAs.push_back("C:/Users/Jefferson/Projetos/padroes_projetos/simulador-hidrometro/images"); 
 
         while(running.load()) {
             try {
-                if (fs::exists(caminhoDoSHA)) {
-                    std::vector<fs::path> pastas;
-                    for (const auto& entry : fs::directory_iterator(caminhoDoSHA)) {
-                        if (entry.is_directory() && entry.path().filename().string().find("Medicoes_") == 0) {
-                            pastas.push_back(entry.path());
+                int indexSHA = 0;
+                for (const auto& raizSHA : locaisDosSHAs) {
+                    indexSHA++;
+                    
+                    // --- MUDANÇA AQUI: Separador é ": " ---
+                    std::string prefixoSHA = "SHA" + std::to_string(indexSHA) + ": "; 
+
+                    if (!fs::exists(raizSHA)) continue;
+
+                    // 1. Busca pasta medicoes
+                    std::vector<fs::path> pastasMedicao;
+                    for (const auto& entry : fs::directory_iterator(raizSHA)) {
+                        if (entry.is_directory()) {
+                            std::string nomeLower = entry.path().filename().string();
+                            std::transform(nomeLower.begin(), nomeLower.end(), nomeLower.begin(), ::tolower);
+                            if (nomeLower.find("medicoes_") == 0) {
+                                pastasMedicao.push_back(entry.path());
+                            }
                         }
                     }
-                    if (!pastas.empty()) {
-                        std::sort(pastas.begin(), pastas.end(), [](const fs::path& a, const fs::path& b) {
-                            return fs::last_write_time(a) > fs::last_write_time(b);
-                        });
-                        std::string medicoesPath = pastas[0].string();
 
-                        for (const auto& entry : fs::directory_iterator(medicoesPath)) {
-                            if (entry.is_directory()) {
-                                std::string nomeSHA = entry.path().filename().string();
-                                std::map<std::string, std::string> params;
-                                params["tipo"] = "arquivo";
-                                params["caminho"] = entry.path().string();
-                                params["idSHA"] = nomeSHA;
-                                FachadaSMH::getInstance().conectarSimulador(params, Token{0, Perfil::ADMIN});
+                    if (pastasMedicao.empty()) continue;
+
+                    std::sort(pastasMedicao.begin(), pastasMedicao.end(), [](const fs::path& a, const fs::path& b) {
+                        return fs::last_write_time(a) > fs::last_write_time(b);
+                    });
+                    std::string pathFinal = pastasMedicao[0].string();
+
+                    // 2. DETECTA SUBPASTAS (O <numero> vem do nome da pasta)
+                    bool achouSubpastas = false;
+                    for (const auto& entry : fs::directory_iterator(pathFinal)) {
+                        if (entry.is_directory()) {
+                            achouSubpastas = true;
+                            std::string nomeOriginal = entry.path().filename().string(); // Ex: "hidrometro1"
+                            
+                            // Gera: "SHA1: hidrometro1"
+                            std::string idComposto = prefixoSHA + nomeOriginal;
+                            
+                            std::map<std::string, std::string> params;
+                            params["tipo"] = "arquivo";
+                            params["caminho"] = entry.path().string();
+                            params["idSHA"] = idComposto;
+                            
+                            FachadaSMH::getInstance().conectarSimulador(params, Token{0, Perfil::ADMIN});
+                        }
+                    }
+
+                    // 3. DETECTA IMAGENS SOLTAS (Sem numero, apenas "hidrometro")
+                    if (!achouSubpastas) {
+                        bool temImagens = false;
+                        for (const auto& entry : fs::directory_iterator(pathFinal)) {
+                            if (entry.is_regular_file()) {
+                                std::string ext = entry.path().extension().string();
+                                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                                if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".txt") {
+                                    temImagens = true;
+                                    break;
+                                }
                             }
+                        }
+
+                        if (temImagens) {
+                            // Gera: "SHA2: hidrometro"
+                            std::string idFixo = prefixoSHA + "hidrometro"; 
+                            
+                            std::map<std::string, std::string> params;
+                            params["tipo"] = "arquivo";
+                            params["caminho"] = pathFinal; 
+                            params["idSHA"] = idFixo;
+
+                            FachadaSMH::getInstance().conectarSimulador(params, Token{0, Perfil::ADMIN});
                         }
                     }
                 }
@@ -587,11 +641,12 @@ int main() {
                             temVinculo = true;
                             shasVinculados.push_back(sha); // Marca como usado
 
-                            std::cout << "SHA: " << std::left << std::setw(15) << sha 
+                            // std::cout << "SHA: " << std::left << std::setw(15) << sha 
+                            std::cout << std::left << std::setw(15) << sha 
                                       << " | Dono: " << std::left << std::setw(10) << u.login;
                             try {
                                 double valor = fachada.obterLeituraAtual(sha, tokenAdmin);
-                                std::cout << " | [ONLINE]  (Leitura: " << valor << ")\n";
+                                std::cout << " | [ONLINE]  (Leitura: " << valor << " m3)\n";
                             } catch (...) {
                                 std::cout << " | [OFFLINE] (Pasta nao encontrada)\n";
                             }
@@ -616,8 +671,9 @@ int main() {
                             // Se está na lista de detectados, com certeza está ONLINE
                             try {
                                 double valor = fachada.obterLeituraAtual(shaFisico, tokenAdmin);
-                                std::cout << "SHA: " << std::left << std::setw(15) << shaFisico 
-                                          << " | [LIVRE]   (Leitura: " << valor << ")\n";
+                                // std::cout << "SHA: " << std::left << std::setw(15) << shaFisico 
+                                std::cout << std::left << std::setw(15) << shaFisico 
+                                          << " | [LIVRE]   (Leitura: " << valor << " m3)\n";
                             } catch(...) {}
                         }
                     }
