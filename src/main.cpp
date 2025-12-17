@@ -20,6 +20,7 @@
 #include <fstream>
 #include <cstring>
 #include <atomic>
+#include <cstdlib>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -186,6 +187,7 @@ public:
             }
             return valor;
         } catch (const std::exception& e) {
+            std::cout << "\n[ERRO FATAL NO SENSOR] Ocorreu uma excecao: " << e.what() << std::endl;
             return 0.0;
         }
     }
@@ -225,7 +227,9 @@ class RegraLimiteFixo : public IStrategiaAnalise {
     double limite;
 public:
     explicit RegraLimiteFixo(double lim) : limite(lim) {}
-    bool analisar(double consumo, std::shared_ptr<IHistoricoRepository>, int) override { return consumo > limite; }
+    bool analisar(double consumo, std::shared_ptr<IHistoricoRepository>, int) override {
+        return consumo > limite;
+    }
     std::string obterMensagem(double consumo) override { return "Consumo " + std::to_string(consumo) + " > Limite " + std::to_string(limite); }
 };
 
@@ -249,7 +253,7 @@ public:
 class PainelObserver : public IEventoObserver {
 public:
     void atualizar(const DadosAlerta& dados) override {
-        std::cout << "\n[ALERTA EM TEMPO REAL] User: " << dados.userId 
+        std::cout << "\n[ALERTA] User: " << dados.userId 
                   << " | Consumo: " << dados.consumo 
                   << " | Msg: " << dados.mensagem << std::endl;
     }
@@ -261,30 +265,63 @@ class AlertaService {
     std::vector<std::pair<int, std::shared_ptr<IStrategiaAnalise>>> regras;
     std::shared_ptr<IHistoricoRepository> historicoRepo;
     mutable std::shared_mutex obsM, regrasM;
+
+    // Mapa para controlar o Cooldown (Hora do último envio por usuário)
+    std::map<int, std::chrono::steady_clock::time_point> ultimoEnvio;
+
 public:
     void setHistoricoRepository(std::shared_ptr<IHistoricoRepository> repo) { historicoRepo = repo; }
+    
     void registrarObservador(std::shared_ptr<IEventoObserver> obs) {
         std::lock_guard<std::shared_mutex> lock(obsM);
         observadores.push_back(obs);
     }
+    
     void adicionarRegra(int userId, std::shared_ptr<IStrategiaAnalise> st) {
         std::lock_guard<std::shared_mutex> lock(regrasM);
         regras.push_back({userId, st});
     }
-    void verificarAlertas(int userId, double consumo) {
+
+    void verificarAlertas(int userId, const std::string& nomeUser, double consumo) {
         std::shared_lock<std::shared_mutex> lockRegras(regrasM);
-        auto regrasLocais = regras;
+        auto regrasLocais = regras; 
         lockRegras.unlock();
 
+        // 2. Itera sobre as regras
         for (const auto& [uid, strategy] : regrasLocais) {
-            if (uid == userId && strategy->analisar(consumo, historicoRepo, userId)) {
-                DadosAlerta dados{userId, consumo, strategy->obterMensagem(consumo), "agora"};
-                if (historicoRepo) {
-                    AlertaRecord rec{0, userId, consumo, dados.mensagem, dados.data};
-                    historicoRepo->salvarAlerta(rec);
+            if (uid == userId) {
+                bool disparou = strategy->analisar(consumo, historicoRepo, userId);
+                
+                if (disparou) {
+                    auto agora = std::chrono::steady_clock::now();
+                    
+                    if (ultimoEnvio.count(userId)) {
+                        auto tempoPassado = std::chrono::duration_cast<std::chrono::seconds>(agora - ultimoEnvio[userId]).count();
+                        if (tempoPassado < 120) {
+                            continue; 
+                        }
+                    }
+                    
+                    // Atualiza o relógio para agora
+                    ultimoEnvio[userId] = agora;
+                    // ==========================
+
+                    auto tempoAtual = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                    std::stringstream ss;
+                    // Formato: Dia/Mês/Ano Hora:Minuto:Segundo
+                    ss << std::put_time(std::localtime(&tempoAtual), "%d/%m/%Y %H:%M:%S");
+                    std::string dataFormatada = ss.str();
+                    
+                    DadosAlerta dados{userId, nomeUser, consumo, strategy->obterMensagem(consumo), dataFormatada};
+                    
+                    if (historicoRepo) {
+                        AlertaRecord rec{0, userId, consumo, dados.mensagem, dados.data};
+                        historicoRepo->salvarAlerta(rec);
+                    }
+                    
+                    std::shared_lock<std::shared_mutex> lockObs(obsM);
+                    for (auto& obs : observadores) obs->atualizar(dados);
                 }
-                std::shared_lock<std::shared_mutex> lockObs(obsM);
-                for (auto& obs : observadores) obs->atualizar(dados);
             }
         }
     }
@@ -419,11 +456,14 @@ public:
     void monitorarConsumo(int userId) {
         std::shared_lock<std::shared_mutex> lock(acessoM);
         if (!usuarioRepo) return;
-        auto user = usuarioRepo->buscarPorId(userId);
-        if (!user) return;
+        
+        // Buscar o usuário para pegar o nome
+        auto userOpt = usuarioRepo->buscarPorId(userId);
+        if (!userOpt.has_value()) return; // Se não achar user, sai
+        auto user = *userOpt;             // Pega o objeto Usuario
 
         auto composite = std::make_shared<UsuarioComposite>();
-        for (const auto& sha : user->hidrometros) {
+        for (const auto& sha : user.hidrometros) {
             auto it = simuladoresById.find(sha);
             if (it != simuladoresById.end()) {
                 composite->adicionarComponente(std::make_shared<HidrometroLeaf>(
@@ -431,7 +471,9 @@ public:
             }
         }
         double consumo = composite->obterConsumo();
-        alertaService.verificarAlertas(userId, consumo);
+        
+        // === MUDANÇA AQUI: Passa user.login ===
+        alertaService.verificarAlertas(userId, user.login, consumo);
     }
 
     void configurarRegraAlerta(int userId, const std::string& tipo, double valor) {
@@ -472,6 +514,76 @@ void exibirMenu() {
     std::cout << "Escolha uma opcao: ";
 }
 
+struct SmtpConfig {
+    std::string server = "localhost";
+    int port = 25;
+    std::string from = "smh@localhost";
+    std::string user;
+    std::string pass;
+    SmtpEmailService::SecureMode secure = SmtpEmailService::SecureMode::NONE;
+};
+
+// static SmtpConfig carregarSmtpConfig() {
+//     SmtpConfig cfg;
+    
+//     cfg.server = "smtp.gmail.com";
+//     cfg.port = 587;
+//     cfg.user = "smhalertas@gmail.com";     // Seu e-mail
+//     cfg.pass = "wzwrvngdhvzwgfcn";         // Sua senha de app
+//     cfg.from = "smhalertas@gmail.com";     // Seu e-mail
+//     cfg.secure = SmtpEmailService::SecureMode::STARTTLS;
+
+//     return cfg;
+// }
+
+// Função auxiliar para limpar espaços em branco (trim)
+static std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (std::string::npos == first) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+static SmtpConfig carregarSmtpConfig() {
+    SmtpConfig cfg;
+    
+    // Configurações padrão
+    cfg.server = "smtp.gmail.com";
+    cfg.port = 587;
+    cfg.secure = SmtpEmailService::SecureMode::STARTTLS;
+    
+    // Tenta abrir o arquivo .env
+    std::ifstream file(".env");
+    
+    if (file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+            // Pula comentários ou linhas vazias
+            if (line.empty() || line[0] == '#') continue;
+
+            auto delimiterPos = line.find('=');
+            if (delimiterPos != std::string::npos) {
+                std::string key = trim(line.substr(0, delimiterPos));
+                std::string value = trim(line.substr(delimiterPos + 1));
+
+                if (key == "SMTP_EMAIL") {
+                    cfg.user = value;
+                    cfg.from = value;
+                } else if (key == "SMTP_PASSWORD") {
+                    cfg.pass = value;
+                }
+            }
+        }
+        file.close();
+        std::cout << "[CONFIG] Credenciais de e-mail carregadas do arquivo .env\n";
+    } else {
+        std::cerr << "[AVISO] Arquivo .env nao encontrado. O envio de e-mails pode falhar.\n";
+        // Você pode deixar vazio ou colocar valores de teste aqui, se quiser
+    }
+
+    return cfg;
+}
+
 int main() {
     #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -479,14 +591,65 @@ int main() {
 
     fs::create_directories("./data");
     
-    std::shared_ptr<IUsuarioRepository> usuarioRepo = std::make_shared<UsuarioRepositorySQLite>("./data/smh.db");
-    std::shared_ptr<IHistoricoRepository> historicoRepo = std::make_shared<HistoricoRepositorySQLite>("./data/smh.db");
+    std::shared_ptr<IUsuarioRepository> usuarioRepo;
+    std::shared_ptr<IHistoricoRepository> historicoRepo;
+
+    #ifdef USE_SQLITE3
+    usuarioRepo = std::make_shared<UsuarioRepositorySQLite>("./data/smh.db");
+    historicoRepo = std::make_shared<HistoricoRepositorySQLite>("./data/smh.db");
+    #else
+    usuarioRepo = std::make_shared<UsuarioRepositoryMemory>();
+    historicoRepo = std::make_shared<HistoricoRepositoryMemory>();
+    #endif
 
     auto& fachada = FachadaSMH::getInstance();
     fachada.setRepository(usuarioRepo);
     fachada.setHistoricoRepository(historicoRepo);
     fachada.setOcrStrategy(std::make_shared<FilenameOcrStrategy>());
     fachada.registrarObservador(std::make_shared<PainelObserver>());
+
+    const auto smtpCfg = carregarSmtpConfig();
+
+    // Registra um serviço de email para cada usuario (usa SMTP local por padrão).
+    auto registrarEmailsParaTodos = [&]() {
+        try {
+            auto users = usuarioRepo->listarTodosUsuarios();
+            for (const auto& u : users) {
+                if (u.email.empty()) continue;
+                auto svc = std::make_shared<SmtpEmailService>(smtpCfg.server, smtpCfg.port, smtpCfg.from,
+                                                             u.email, smtpCfg.user, smtpCfg.pass, smtpCfg.secure, u.id);
+                fachada.registrarObservador(svc);
+            }
+        } catch(...) {}
+    };
+    registrarEmailsParaTodos();
+
+    // Carregar regras de alerta do banco de dados para a memória (Restaurar estado)
+    auto carregarRegrasDoBanco = [&]() {
+        try {
+            auto users = usuarioRepo->listarTodosUsuarios();
+            for (const auto& u : users) {
+                auto regrasBD = historicoRepo->listarRegrasPorUsuario(u.id);
+
+                // Se o usuário não tiver regra persistida, cria uma padrão (limite 3.0)
+                // if (regrasBD.empty()) {
+                //     fachada.configurarRegraAlerta(u.id, "limite", 3.0);
+                //     continue;
+                // }
+
+                fachada.configurarRegraAlerta(u.id, "limite", 4.0);
+
+                // Restaura regras existentes
+                // for (const auto& r : regrasBD) {
+                //     std::string tipo = std::get<2>(r);
+                //     double valor = std::get<3>(r);
+                //     fachada.configurarRegraAlerta(u.id, tipo, valor);
+                // }
+            }
+            std::cout << "[SISTEMA] Regras de alerta restauradas do banco de dados.\n";
+        } catch(...) {}
+    };
+    carregarRegrasDoBanco();
 
     Token tokenAdmin;
     auto adminUser = usuarioRepo->buscarPorLogin("admin");
@@ -510,6 +673,14 @@ int main() {
 
         while(running.load()) {
             try {
+                // 1. Monitoramento de Consumo (Alertas em Background)
+                auto users = usuarioRepo->listarTodosUsuarios();
+                // std::cout << "[DEBUG-THREAD] Monitorando " << users.size() << " usuarios..." << std::endl;
+                for (const auto& u : users) {
+                    FachadaSMH::getInstance().monitorarConsumo(u.id);
+                }
+
+                // 2. Detecção de Novos Simuladores
                 int indexSHA = 0;
                 for (const auto& raizSHA : locaisDosSHAs) {
                     indexSHA++;
@@ -605,7 +776,15 @@ int main() {
                     std::cout << "Email: "; std::cin >> e;
                     std::cout << "Perfil (0=Admin, 1=Leitor): "; std::cin >> p;
                     auto u = fachada.criarUsuario(l, s, e, static_cast<Perfil>(p), tokenAdmin);
-                    fachada.configurarRegraAlerta(u.id, "limite", 50.0);
+                    // Registrar serviço de email para o novo usuário (se possível)
+                    try {
+                        if (!u.email.empty()) {
+                            auto svc = std::make_shared<SmtpEmailService>(smtpCfg.server, smtpCfg.port, smtpCfg.from,
+                                                                         u.email, smtpCfg.user, smtpCfg.pass, smtpCfg.secure, u.id);
+                            fachada.registrarObservador(svc);
+                        }
+                    } catch(...) {}
+                    fachada.configurarRegraAlerta(u.id, "limite", 3.0);
                     std::cout << ">> Usuario criado (ID " << u.id << ")\n";
                     break;
                 }
@@ -685,7 +864,9 @@ int main() {
                 case 5: {
                     int uid; std::string sha;
                     std::cout << "ID User: "; std::cin >> uid;
-                    std::cout << "Nome SHA (ex: hidrometro1): "; std::cin >> sha;
+                    std::cin.ignore(10000, '\n'); // Limpar buffer
+                    std::cout << "Nome SHA (ex: SHA1: hidrometro1): "; 
+                    std::getline(std::cin, sha);
                     fachada.vincularHidrometro(uid, sha, tokenAdmin);
                     std::cout << ">> Vinculado!\n";
                     break;
@@ -695,7 +876,9 @@ int main() {
                     int uid; std::string sha;
                     std::cout << "--- DESVINCULAR HIDROMETRO ---\n";
                     std::cout << "ID do Usuario dono: "; std::cin >> uid;
-                    std::cout << "Nome do SHA para remover (ex: hidrometro1): "; std::cin >> sha;
+                    std::cin.ignore(10000, '\n'); // Limpar buffer
+                    std::cout << "Nome do SHA para remover (ex: SHA1: hidrometro1): "; 
+                    std::getline(std::cin, sha);
                     
                     fachada.desvincularHidrometro(uid, sha, tokenAdmin);
                     

@@ -46,6 +46,7 @@ struct AlertaRecord {
 
 struct DadosAlerta {
     int userId = 0;
+    std::string nomeUser;
     double consumo = 0.0;
     std::string mensagem;
     std::string data;
